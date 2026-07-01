@@ -6,6 +6,13 @@ use ExpressionEngine\Model\Channel\Channel;
 use ExpressionEngine\Model\Channel\ChannelField;
 use ExpressionEngine\Model\Category\Category;
 use ExpressionEngine\Model\Status\Status;
+use YourCompany\FieldManagerPro\FieldTypes\AdapterRegistry;
+use YourCompany\FieldManagerPro\Services\Integrations\BloqsIntegration;
+use YourCompany\FieldManagerPro\Services\Integrations\FieldtypeIntegrationManager;
+use YourCompany\FieldManagerPro\Support\DependencySorter;
+use YourCompany\FieldManagerPro\Support\IdMap;
+use YourCompany\FieldManagerPro\Support\ImportContext;
+use YourCompany\FieldManagerPro\Support\KeyResolver;
 
 /**
  * Handles JSON parsing plus model creation during imports.
@@ -16,9 +23,20 @@ class FieldImporter
 
     protected array $errors = [];
 
+    protected array $warnings = [];
+
+    protected AdapterRegistry $registry;
+
+    protected IdMap $idMap;
+
+    protected ImportContext $importCtx;
+
     public function __construct()
     {
         $this->validator = new ValidationService();
+        $this->registry = new AdapterRegistry();
+        $this->idMap = new IdMap();
+        $this->importCtx = new ImportContext(new KeyResolver(), $this->idMap);
     }
 
     public function preview(string $payload): array
@@ -47,9 +65,22 @@ class FieldImporter
             return ['success' => false, 'errors' => $this->errors];
         }
 
+        // Refuse v1 (or unversioned) exports rather than mis-importing their
+        // base64/serialized settings. Detect-and-refuse only — no v1 reader.
+        if (! $this->validator->validateFormatVersion($decoded)) {
+            $this->errors = $this->validator->getErrors();
+
+            return ['success' => false, 'errors' => $this->errors];
+        }
+
         ee()->db->trans_start();
 
         $fields = $this->normalizeFieldPayloads($decoded);
+        $integrationManager = $this->makeIntegrationManager();
+        $integrationPayload = $decoded['integrations'] ?? [];
+        if (! empty($decoded['bloqs']) && empty($integrationPayload['bloqs'])) {
+            $integrationPayload['bloqs'] = $decoded['bloqs'];
+        }
         $groupPayloads = $decoded['field_groups'] ?? [];
         if (empty($groupPayloads)) {
             $groupPayloads = $this->collectGroupsFromData($decoded['channels'] ?? [], $fields);
@@ -60,16 +91,30 @@ class FieldImporter
             'channels' => $this->importChannels($decoded['channels'] ?? []),
         ];
 
+        if (! empty($integrationPayload)) {
+            $fieldsByName = $this->getFieldModelsByName($fields);
+            $integrationErrors = $integrationManager->import($integrationPayload, $fieldsByName);
+            $this->errors = array_merge($this->errors, $integrationErrors);
+        }
+
         ee()->db->trans_complete();
 
         if (ee()->db->trans_status() === false) {
             $this->errors[] = lang('field_manager_pro_import_transaction_failed');
         }
 
+        $this->errors = array_merge($this->errors, $integrationManager->getErrors());
+        $this->warnings = array_merge($this->warnings, $this->importCtx->getWarnings());
         $result['success'] = empty($this->errors);
         $result['errors'] = $this->getLastErrors();
+        $result['warnings'] = $this->getWarnings();
 
         return $result;
+    }
+
+    public function getWarnings(): array
+    {
+        return array_values(array_unique($this->warnings));
     }
 
     protected function normalizeFieldPayloads(array $decoded): array
@@ -144,8 +189,20 @@ class FieldImporter
 
     protected function importFields(array $fields, string $strategy): array
     {
-        $imported = [];
+        // Order fields so that any in-batch field another field depends on
+        // (e.g. a Fluid field's allowed children) is created first.
+        try {
+            $fields = (new DependencySorter($this->registry))->sort($fields);
+        } catch (\RuntimeException $e) {
+            $this->errors[] = $e->getMessage();
 
+            return [];
+        }
+
+        $imported = [];
+        $deferred = [];
+
+        // --- Phase A: structure -------------------------------------------
         foreach ($fields as $payload) {
             $siteId = (int) ($payload['site_id'] ?? ee()->config->item('site_id'));
             if ($siteId < 1) {
@@ -185,15 +242,33 @@ class FieldImporter
 
             $field = $this->makeField($payload, $siteId);
 
+            // Resolve portable, natural-keyed settings into EE settings (ids).
+            $this->importCtx->setCurrentField($fieldName);
+            $portableSettings = is_array($payload['settings'] ?? null) ? $payload['settings'] : [];
+            $resolvedSettings = $this->registry->for($field->field_type)
+                ->import($portableSettings, $this->importCtx);
+            $field->setProperty('field_settings', $resolvedSettings);
+
             $validation = $field->validate();
             if ($validation->isValid()) {
                 $field->save();
                 $this->assignGroups($field, $payload['groups'] ?? []);
                 $this->syncGridColumns($field, $payload['grid_columns'] ?? []);
+                // Register under the original portable name so later in-run
+                // fields resolve references to this one via the IdMap.
+                $this->idMap->put('field:' . $fieldName, (int) $field->field_id);
+                $deferred[] = [$field, $payload, $portableSettings];
                 $imported[] = ['field_name' => $field->field_name, 'status' => 'imported'];
             } else {
                 $this->errors = array_merge($this->errors, $validation->getAllErrors());
             }
+        }
+
+        // --- Phase B: deferred resolution (no-op for relationship/fluid) ---
+        foreach ($deferred as [$field, $payload, $portableSettings]) {
+            $this->importCtx->setCurrentField($payload['field_name'] ?? '');
+            $this->registry->for($field->field_type)
+                ->resolveDeferred($field, $portableSettings, $this->importCtx);
         }
 
         return $imported;
@@ -245,6 +320,7 @@ class FieldImporter
             }
 
             $channel->save();
+            $this->idMap->put('channel:' . $channel->channel_name, (int) $channel->channel_id);
             $channelGroups = $channelPayload['field_groups'] ?? [];
             if (! empty($channelPayload['field_group'])) {
                 $channelGroups[] = $channelPayload['field_group'];
@@ -288,8 +364,8 @@ class FieldImporter
         $field->field_maxl = $payload['field_maxl'] ?? 0;
         $field->field_ta_rows = $payload['field_ta_rows'] ?? 0;
 
-        $settings = $this->unpackSettings($payload['field_settings'] ?? '');
-        $field->setProperty('field_settings', $settings);
+        // field_settings is resolved by the type adapter and set by the caller
+        // after this scaffold is built (two-phase import).
 
         return $field;
     }
@@ -308,29 +384,6 @@ class FieldImporter
             $field->ChannelFieldGroups = $groupModels;
             $field->save();
         }
-    }
-
-    protected function unpackSettings(string $serialized): array
-    {
-        if (empty($serialized)) {
-            return [];
-        }
-
-        $decoded = base64_decode($serialized, true);
-        if ($decoded === false) {
-            $this->errors[] = lang('field_manager_pro_settings_decode_failed');
-
-            return [];
-        }
-
-        $settings = @unserialize($decoded);
-        if (! is_array($settings)) {
-            $this->errors[] = lang('field_manager_pro_settings_unserialize_failed');
-
-            return [];
-        }
-
-        return $settings;
     }
 
     protected function attachFieldGroups(Channel $channel, array $groups): void
@@ -505,5 +558,40 @@ class FieldImporter
         }
 
         return substr('field_group_' . $slug, 0, 50);
+    }
+
+    protected function getFieldModelsByName(array $fields): array
+    {
+        $names = [];
+        foreach ($fields as $field) {
+            if (! empty($field['field_name'])) {
+                $names[] = $field['field_name'];
+            }
+        }
+
+        if (empty($names)) {
+            return [];
+        }
+
+        $names = array_unique($names);
+        $query = ee('Model')->get('ChannelField')
+            ->filter('field_name', 'IN', $names)
+            ->all();
+
+        $map = [];
+        foreach ($query as $field) {
+            $map[$field->field_name] = $field;
+        }
+
+        return $map;
+    }
+
+    protected function makeIntegrationManager(): FieldtypeIntegrationManager
+    {
+        $manager = new FieldtypeIntegrationManager();
+        $manager->registerAdapter(new BloqsIntegration());
+        $manager->bootExternalAdapters();
+
+        return $manager;
     }
 }

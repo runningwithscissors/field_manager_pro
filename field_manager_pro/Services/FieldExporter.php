@@ -5,6 +5,11 @@ namespace YourCompany\FieldManagerPro\Services;
 use ExpressionEngine\Model\Channel\Channel;
 use ExpressionEngine\Model\Channel\ChannelField;
 use ExpressionEngine\Model\Channel\ChannelFieldGroup;
+use YourCompany\FieldManagerPro\FieldTypes\AdapterRegistry;
+use YourCompany\FieldManagerPro\Services\Integrations\BloqsIntegration;
+use YourCompany\FieldManagerPro\Services\Integrations\FieldtypeIntegrationManager;
+use YourCompany\FieldManagerPro\Support\ExportContext;
+use YourCompany\FieldManagerPro\Support\KeyResolver;
 
 /**
  * Handles marshalling EE models to portable JSON structures.
@@ -13,9 +18,15 @@ class FieldExporter
 {
     protected ValidationService $validator;
 
+    protected AdapterRegistry $registry;
+
+    protected ExportContext $exportCtx;
+
     public function __construct()
     {
         $this->validator = new ValidationService();
+        $this->registry = new AdapterRegistry();
+        $this->exportCtx = new ExportContext(new KeyResolver());
     }
 
     public function getChannelSummaries(): array
@@ -81,13 +92,23 @@ class FieldExporter
             }
         }
 
+        $integrationManager = $this->makeIntegrationManager();
+        $integrations = $integrationManager->export($fields, $channels);
+        $log = array_merge(
+            $this->validator->getErrors(),
+            $integrationManager->getErrors(),
+            $this->exportCtx->getWarnings()
+        );
+
         return array_merge(
             $this->metadata($type, $siteId),
             [
                 'channels' => $channels,
                 'field_groups' => array_values($fieldGroups),
                 'fields' => array_values($fields),
-                'log' => $this->validator->getErrors(),
+                'integrations' => $integrations,
+                'bloqs' => $integrations['bloqs'] ?? [],
+                'log' => $log,
             ]
         );
     }
@@ -197,6 +218,12 @@ class FieldExporter
     protected function formatField(ChannelField $field): array
     {
         $settings = $field->getSettingsValues();
+        $rawSettings = $settings['field_settings'] ?? [];
+
+        // v2: plain, natural-keyed settings via the per-field-type adapter.
+        // No base64, no PHP-serialized strings.
+        $portableSettings = $this->registry->for($field->field_type)
+            ->export($field, is_array($rawSettings) ? $rawSettings : [], $this->exportCtx);
 
         return [
             'field_id' => $field->field_id,
@@ -209,15 +236,12 @@ class FieldExporter
             'field_instructions' => $field->field_instructions,
             'field_required' => $field->field_required,
             'field_search' => $field->field_search,
-            'field_settings' => base64_encode(serialize($settings['field_settings'] ?? [])),
+            'settings' => $portableSettings,
             'field_fmt' => $field->field_fmt,
             'field_show_fmt' => $field->field_show_fmt,
             'field_maxl' => $field->field_maxl,
             'field_ta_rows' => $field->field_ta_rows,
-            'grid_config' => $settings['grid'] ?? [],
             'grid_columns' => $this->getGridColumns($field),
-            'relationship_config' => $settings['rel'] ?? [],
-            'file_config' => $settings['file'] ?? [],
             'list_config' => $this->normalizeListItems($field),
             'groups' => $this->collectGroups($field),
         ];
@@ -247,7 +271,10 @@ class FieldExporter
     protected function metadata(string $type, ?int $siteId = null): array
     {
         return [
-            'export_version' => '1.0.0',
+            // Authoritative format identifier for the v2 portable schema.
+            'format_version' => '2.0.0',
+            // Retained for display/back-reference only; format_version governs.
+            'export_version' => '2.0.0',
             'export_date' => gmdate('c'),
             'ee_version' => defined('APP_VER') ? APP_VER : '7.x.x',
             'site_id' => (int) ($siteId ?: ee()->config->item('site_id')),
@@ -397,5 +424,14 @@ class FieldExporter
         }
 
         return $export;
+    }
+
+    protected function makeIntegrationManager(): FieldtypeIntegrationManager
+    {
+        $manager = new FieldtypeIntegrationManager();
+        $manager->registerAdapter(new BloqsIntegration());
+        $manager->bootExternalAdapters();
+
+        return $manager;
     }
 }

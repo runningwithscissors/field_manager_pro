@@ -60,6 +60,18 @@
             </div>
         <?php endif; ?>
 
+        <?php if (! empty($warnings)): ?>
+            <div class="alert inline warn">
+                <h3><?=lang('field_manager_pro_import_warnings')?></h3>
+                <ul>
+                    <?php foreach ($warnings as $warning): ?>
+                        <?php if (is_array($warning)) $warning = implode(', ', array_filter($warning)); ?>
+                        <li><?=$warning?></li>
+                    <?php endforeach; ?>
+                </ul>
+            </div>
+        <?php endif; ?>
+
             <fieldset class="form-ctrls">
                 <button class="btn" name="action" value="preview"><?=lang('field_manager_pro_preview_button')?></button>
                 <button class="btn action" name="action" value="import"><?=lang('field_manager_pro_import_button')?></button>

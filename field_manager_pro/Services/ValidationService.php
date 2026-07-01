@@ -31,6 +31,32 @@ class ValidationService
         return $data;
     }
 
+    /**
+     * Gate the import on the authoritative envelope format_version. A missing
+     * version or a major version below 2 is a v1 export whose base64/serialized
+     * settings must not be mis-imported — refuse and instruct re-export. Stays
+     * tolerant of future 2.x minors.
+     */
+    public function validateFormatVersion(array $data): bool
+    {
+        $version = $data['format_version'] ?? null;
+
+        if (! is_string($version) || $version === '') {
+            $this->errors[] = lang('field_manager_pro_v1_export_refused');
+
+            return false;
+        }
+
+        $major = (int) explode('.', $version)[0];
+        if ($major < 2) {
+            $this->errors[] = lang('field_manager_pro_v1_export_refused');
+
+            return false;
+        }
+
+        return true;
+    }
+
     public function validateFieldName(string $name, int $siteId): bool
     {
         if (empty($name)) {

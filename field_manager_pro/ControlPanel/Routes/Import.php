@@ -28,6 +28,7 @@ class Import extends AbstractRoute
         $this->authorize();
         $preview = [];
         $errors = [];
+        $warnings = [];
         $result = null;
         $selectedStrategy = ee()->input->post('strategy') ?: (ee()->config->item('field_manager_pro')['conflict_strategy'] ?? 'prompt');
         $action = ee()->input->post('action');
@@ -37,6 +38,7 @@ class Import extends AbstractRoute
             if ($action === 'import') {
                 $result = $this->importer->import($payload, $selectedStrategy);
                 $errors = $result['errors'] ?? [];
+                $warnings = $result['warnings'] ?? [];
             } else {
                 $preview = $this->importer->preview($payload);
                 $errors = $this->importer->getLastErrors();
@@ -47,6 +49,7 @@ class Import extends AbstractRoute
             'import_action' => ee('CP/URL')->make('addons/settings/field_manager_pro/import'),
             'preview' => $preview,
             'errors' => $errors,
+            'warnings' => $warnings,
             'result' => $result,
             'strategies' => [
                 'prompt' => lang('field_manager_pro_conflict_prompt'),
